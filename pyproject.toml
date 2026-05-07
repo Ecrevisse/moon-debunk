@@ -8,6 +8,7 @@ dependencies = [
     "ephem>=4.2.1",
     "matplotlib>=3.10.9",
     "pandas>=3.0.2",
+    "plotly>=6.7.0",
     "scipy>=1.17.1",
     "streamlit>=1.57.0",
 ]
