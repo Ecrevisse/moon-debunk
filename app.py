@@ -88,15 +88,21 @@ def load_birth_lunar_ages(birth_dates_tuple):
 
 
 @st.cache_data(show_spinner="Distribution par cycle lunaire (jour de naissance)…")
-def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
+def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30):
     """
     x-axis: birth lunar day.
+
     Observed: actual sex ratio per bin.
-    Theoretical: propagates the waxing/waning effect at conception through the
-    gestation distribution. P_waxing(birth_date) = gestation-weighted fraction
-    of the conception window (200-300 days) that falls on a waxing moon.
-    Because the window spans ~3.4 lunar cycles, P_waxing ≈ 0.5 for all birth
-    dates — the signal is almost entirely destroyed.
+
+    Theoretical (100% deterministic belief):
+      - Waxing conception → 100% boy
+      - Waning conception → 100% girl
+      p_boy_theo = P_waxing(birth_date)
+        where P_waxing = gestation-weighted fraction of the conception window
+        (200-300 days before birth) that falls on a waxing moon day.
+      Because the window spans ~3.4 lunar cycles, P_waxing ≈ 0.5 for all
+      birth dates — the theoretical curve is nearly flat even under the
+      strongest possible version of the belief.
     """
     df = _load_births()
     gest = pd.read_csv("daily_gestation_probabilities.csv")
@@ -106,10 +112,6 @@ def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
 
     moon_cache = load_moon_cache(birth_dates_tuple)
     birth_ages = load_birth_lunar_ages(birth_dates_tuple)
-
-    total_M = df.loc[df["gender"] == "M", "births"].sum()
-    total_F = df.loc[df["gender"] == "F", "births"].sum()
-    global_p = total_M / (total_M + total_F)
 
     obs_M  = np.zeros(n_bins)
     obs_F  = np.zeros(n_bins)
@@ -126,12 +128,11 @@ def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
         else:
             obs_F[b_bin] += births
 
-        # Gestation-weighted fraction of waxing conception days for this birth date
+        # P_waxing: under the 100% belief, this IS p_boy for this birth date
         P_waxing = sum(gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1])
 
-        p_boy_theo = float(np.clip(global_p + effect_delta * (2 * P_waxing - 1), 0, 1))
-        theo_M[b_bin] += births * p_boy_theo
-        theo_F[b_bin] += births * (1 - p_boy_theo)
+        theo_M[b_bin] += births * P_waxing
+        theo_F[b_bin] += births * (1.0 - P_waxing)
 
     return obs_M, obs_F, theo_M, theo_F
 
@@ -332,16 +333,7 @@ st.caption(
 N_BINS = 30
 LUNAR_CYCLE = 29.53059
 
-# Sidebar: effect size
-effect_delta = st.sidebar.slider(
-    "Effet théorique Δ (probabilité garçon)", min_value=0.01, max_value=0.20,
-    value=0.05, step=0.01,
-    help="Δ = shift absolu de P(garçon). Ex: Δ=0.05 → P(garçon|lune montante)=56%, P(garçon|lune descendante)=46%"
-)
-
-obs_M, obs_F, theo_M, theo_F = compute_birth_lunar_cycle(
-    birth_dates_tuple, N_BINS, effect_delta
-)
+obs_M, obs_F, theo_M, theo_F = compute_birth_lunar_cycle(birth_dates_tuple, N_BINS)
 
 bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
 bin_total_obs = obs_M + obs_F
@@ -364,10 +356,11 @@ obs_smooth = np.array([
 ])
 
 global_avg = float(np.nansum(obs_M) / np.nansum(obs_F) * 100)
-obs_std   = float(np.nanstd(obs_ratio))
-theo_amp  = float(np.nanmax(theo_ratio) - np.nanmin(theo_ratio))
-# Amplitude the theory would produce WITHOUT gestation blurring (pure step in conception space)
-naive_amp = effect_delta * 2 / 0.488 * 100  # approx: Δ applied to waxing vs waning halves
+obs_std  = float(np.nanstd(obs_ratio))
+theo_amp = float(np.nanmax(theo_ratio) - np.nanmin(theo_ratio))
+# If belief were perfectly true with no gestation blur: 100% boys vs 100% girls → ratio goes 0 to ∞
+# The gestation-blurred version collapses that to theo_amp ≈ near zero
+naive_amp = theo_amp if theo_amp > 0 else 1.0  # for annotation y-positioning only
 
 fig_cycle, ax_c = plt.subplots(figsize=(12, 5.5))
 fig_cycle.patch.set_facecolor("#0f1117")
@@ -389,10 +382,10 @@ ax2_c.set_ylim(0, bin_total_obs.max() / 1e6 * 8)
 ax_c.axhline(global_avg, color="#ff4b4b", linewidth=1.1, linestyle=":",
              label=f"Moyenne globale : {global_avg:.3f}", zorder=3)
 
-# Theoretical with gestation (nearly flat)
+# Theoretical: 100% deterministic belief + real gestation distribution
 ax_c.plot(bin_centers, theo_ratio, color="#e040fb", linewidth=2.2,
           linestyle="-",
-          label=f"Théorique (Δ={effect_delta}, convolution gestation) — amplitude {theo_amp:.4f} g/100f",
+          label=f"Théorique (croyance 100% + distribution gestation réelle) — amplitude {theo_amp:.4f} g/100f",
           zorder=5)
 
 # CI band observed
@@ -407,32 +400,34 @@ ax_c.plot(bin_centers, obs_smooth, color="#4caf50", linewidth=2.2,
           label=f"Observé lissé + IC 95% (σ={obs_std:.3f})", zorder=6)
 
 # Moon markers
+ci_max = float(np.nanmax(obs_ci[~np.isnan(obs_ci)]))
+y_top = global_avg + ci_max + 0.6
 for x, sym in [(0, "🌑"), (LUNAR_CYCLE / 4, "🌓"), (LUNAR_CYCLE / 2, "🌕"), (LUNAR_CYCLE * 3 / 4, "🌗")]:
     ax_c.axvline(x, color="#333", linewidth=0.8, linestyle="--", zorder=1)
-    ax_c.text(x, global_avg + naive_amp / 2 + 0.4, sym, ha="center", fontsize=13, zorder=7)
+    ax_c.text(x, y_top, sym, ha="center", fontsize=13, zorder=7)
 
 # Annotation
-ratio_reduction = (1 - theo_amp / naive_amp) * 100 if naive_amp > 0 else 0
 ax_c.annotate(
-    f"Effet théorique à la conception (Δ={effect_delta}) : ±{naive_amp/2:.2f} g/100f\n"
-    f"Signal résiduel à la naissance (après convolution gestation) : {theo_amp:.4f} g/100f\n"
-    f"→ Réduction : {ratio_reduction:.0f}% — signal indétectable même si la théorie est vraie.",
-    xy=(LUNAR_CYCLE * 0.01, global_avg - naive_amp / 2 - 0.3),
+    f"Croyance : lune montante = 100% garçon, descendante = 100% fille\n"
+    f"La distribution de gestation (200–300 j) couvre ~3.4 cycles lunaires :\n"
+    f"chaque naissance a ~50% de ses conceptions en lune montante, ~50% descendante.\n"
+    f"→ Amplitude théorique résiduelle : {theo_amp:.4f} g/100f ≈ indiscernable du bruit ({obs_std:.3f})",
+    xy=(LUNAR_CYCLE * 0.01, global_avg - max(obs_ci[~np.isnan(obs_ci)]) - 1.8),
     fontsize=8.5, color="white", va="top",
     bbox=dict(boxstyle="round,pad=0.5", facecolor="#0d1020", edgecolor="#555"),
 )
 
 # Labels / waxing / waning text
-ax_c.text(LUNAR_CYCLE * 0.25, global_avg + naive_amp / 2 + 0.1,
+ax_c.text(LUNAR_CYCLE * 0.25, y_top + 0.5,
           "← Lune montante →", ha="center", color="#f5c518", fontsize=8, alpha=0.7)
-ax_c.text(LUNAR_CYCLE * 0.75, global_avg + naive_amp / 2 + 0.1,
+ax_c.text(LUNAR_CYCLE * 0.75, y_top + 0.5,
           "← Lune descendante →", ha="center", color="#5b9bd5", fontsize=8, alpha=0.7)
 
 ax_c.set_xlabel("Jour du cycle lunaire (à la naissance)", color="white", fontsize=10)
 ax_c.set_ylabel("Garçons pour 100 filles", color="white", fontsize=10)
 ax_c.set_xlim(0, LUNAR_CYCLE)
-y_margin = naive_amp / 2 + max(obs_ci[~np.isnan(obs_ci)]) + 1
-ax_c.set_ylim(global_avg - y_margin - 0.5, global_avg + y_margin + 1.5)
+y_margin = ci_max + 2.5
+ax_c.set_ylim(global_avg - y_margin - 2, global_avg + y_margin + 1.5)
 ax_c.tick_params(colors="white")
 for spine in ax_c.spines.values():
     spine.set_edgecolor("#333")
