@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import ephem
 import matplotlib.pyplot as plt
 from datetime import timedelta
@@ -7,31 +8,68 @@ from datetime import timedelta
 st.set_page_config(page_title="Lune & Sexe du Bébé — Debunker", layout="wide")
 
 PHASE_ORDER = [
-    "Nouvelle lune",
-    "Croissant montant",
-    "Premier quartier",
-    "Gibbeuse montante",
-    "Pleine lune",
-    "Gibbeuse descendante",
-    "Dernier quartier",
-    "Croissant descendant",
+    "Nouvelle lune", "Croissant montant", "Premier quartier", "Gibbeuse montante",
+    "Pleine lune", "Gibbeuse descendante", "Dernier quartier", "Croissant descendant",
 ]
+PHASE_COLORS = [
+    "#555", "#6a7fb5", "#5b9bd5", "#a8c8f0",
+    "#f5c518", "#d4a017", "#c08000", "#8a6000",
+]
+WAXING_PHASES = {"Nouvelle lune", "Croissant montant", "Premier quartier", "Gibbeuse montante"}
 
-PHASE_COLORS = {
-    "Nouvelle lune":        "#444",
-    "Croissant montant":    "#6a7fb5",
-    "Premier quartier":     "#5b9bd5",
-    "Gibbeuse montante":    "#a8c8f0",
-    "Pleine lune":          "#f5c518",
-    "Gibbeuse descendante": "#d4a017",
-    "Dernier quartier":     "#c08000",
-    "Croissant descendant": "#8a6000",
-}
+# ── Core computation ──────────────────────────────────────────────────────────
 
-# ── Computation ───────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Calcul des phases lunaires pour toutes les dates possibles…")
+def load_moon_cache(birth_dates_tuple):
+    offsets = list(range(200, 301))
+    all_dates = set()
+    for bd in birth_dates_tuple:
+        for o in offsets:
+            all_dates.add(bd - timedelta(days=o))
 
-@st.cache_data(show_spinner="Calcul des phases lunaires…")
-def load_and_compute() -> pd.DataFrame:
+    def moon_info(date):
+        moon = ephem.Moon()
+        moon.compute(date.strftime("%Y/%m/%d"))
+        illum = moon.phase
+        moon.compute((date + timedelta(days=1)).strftime("%Y/%m/%d"))
+        is_waxing = moon.phase > illum
+        if illum < 3:             phase = "Nouvelle lune"
+        elif illum < 50 and is_waxing:  phase = "Croissant montant"
+        elif illum < 55 and is_waxing:  phase = "Premier quartier"
+        elif illum < 98 and is_waxing:  phase = "Gibbeuse montante"
+        elif illum >= 98:         phase = "Pleine lune"
+        elif illum >= 50:         phase = "Gibbeuse descendante"
+        elif illum >= 45:         phase = "Dernier quartier"
+        else:                     phase = "Croissant descendant"
+        return illum, is_waxing, phase
+
+    return {d: moon_info(d) for d in sorted(all_dates)}
+
+
+@st.cache_data(show_spinner="Distribution pondérée des naissances…")
+def compute_weighted(birth_dates_tuple):
+    df = _load_births()
+    gest = pd.read_csv("daily_gestation_probabilities.csv")
+    gest_w = dict(zip(gest["jours_depuis_conception"].astype(int), gest["probabilite"]))
+    offsets = sorted(gest_w.keys())
+
+    moon_cache = load_moon_cache(birth_dates_tuple)
+
+    phase_births = {p: {"M": 0.0, "F": 0.0} for p in PHASE_ORDER}
+
+    for _, row in df.iterrows():
+        bd, gender, births = row["date"], row["gender"], row["births"]
+        for o in offsets:
+            cd = bd - timedelta(days=o)
+            w = gest_w[o]
+            _, _, phase = moon_cache[cd]
+            phase_births[phase][gender] += births * w
+
+    return phase_births
+
+
+@st.cache_data
+def _load_births():
     df = pd.read_csv("births.csv")
     df = df.dropna(subset=["year", "month", "day"])
     df = df[df["day"] != 99]
@@ -43,86 +81,57 @@ def load_and_compute() -> pd.DataFrame:
             return pd.NaT
 
     df["date"] = df.apply(safe_ts, axis=1)
-    df = df.dropna(subset=["date"])
-    df["conception_date"] = df["date"] - timedelta(weeks=38)
-
-    def moon_info(date):
-        moon = ephem.Moon()
-        moon.compute(date.strftime("%Y/%m/%d"))
-        illum_today = moon.phase
-        moon.compute((date + timedelta(days=1)).strftime("%Y/%m/%d"))
-        illum_next = moon.phase
-        is_waxing = illum_next > illum_today
-
-        if illum_today < 3:
-            phase = "Nouvelle lune"
-        elif illum_today < 50 and is_waxing:
-            phase = "Croissant montant"
-        elif illum_today < 55 and is_waxing:
-            phase = "Premier quartier"
-        elif illum_today < 98 and is_waxing:
-            phase = "Gibbeuse montante"
-        elif illum_today >= 98:
-            phase = "Pleine lune"
-        elif illum_today >= 50 and not is_waxing:
-            phase = "Gibbeuse descendante"
-        elif illum_today >= 45 and not is_waxing:
-            phase = "Dernier quartier"
-        else:
-            phase = "Croissant descendant"
-
-        return illum_today, is_waxing, phase
-
-    info = df["conception_date"].apply(
-        lambda d: pd.Series(moon_info(d), index=["moon_phase", "is_waxing", "phase_name"])
-    )
-    return pd.concat([df, info], axis=1)
+    return df.dropna(subset=["date"])
 
 
-def sex_ratio(subset: pd.DataFrame) -> float:
-    m = subset.loc[subset["gender"] == "M", "births"].sum()
-    f = subset.loc[subset["gender"] == "F", "births"].sum()
+def sex_ratio(d):
+    m, f = d.get("M", 0.0), d.get("F", 0.0)
     return (m / f) * 100 if f > 0 else 0.0
 
 
-def ratio_ci(subset: pd.DataFrame):
-    """Wilson-like approx: return (ratio, margin) using sqrt(p(1-p)/n)*100."""
+def ratio_ci(d):
     import math
-    m = subset.loc[subset["gender"] == "M", "births"].sum()
-    f = subset.loc[subset["gender"] == "F", "births"].sum()
+    m, f = d.get("M", 0.0), d.get("F", 0.0)
     n = m + f
-    if n == 0:
+    if n == 0 or f == 0:
         return 0.0, 0.0
     p = m / n
-    margin = 1.96 * math.sqrt(p * (1 - p) / n) * 100 / (f / n) if f > 0 else 0
+    margin = 1.96 * math.sqrt(p * (1 - p) / n) * 100 / (f / n)
     return (m / f) * 100, margin
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 
-df = load_and_compute()
-waxing = df[df["is_waxing"]]
-waning = df[~df["is_waxing"]]
+df_births = _load_births()
+birth_dates_tuple = tuple(sorted(df_births["date"].unique()))
+phase_births = compute_weighted(birth_dates_tuple)
+
+waxing_agg = {"M": 0.0, "F": 0.0}
+waning_agg = {"M": 0.0, "F": 0.0}
+for phase, gdict in phase_births.items():
+    target = waxing_agg if phase in WAXING_PHASES else waning_agg
+    for g, v in gdict.items():
+        target[g] += v
+
+r_wax, ci_wax = ratio_ci(waxing_agg)
+r_wan, ci_wan = ratio_ci(waning_agg)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 
 st.title("🌙 La phase lunaire influence-t-elle le sexe du bébé ?")
 st.markdown(
     "Analyse basée sur **39 ans** de naissances américaines (CDC 1969–2008). "
-    "La croyance : concevoir pendant une lune *montante* favoriserait les garçons, "
-    "et vice versa."
+    "Chaque naissance est distribuée probabilistement sur les **101 jours de conception possibles** "
+    "(200–300 jours avant la naissance) selon la distribution de gestation de Jukic et al. (2013)."
 )
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
 
-r_wax, ci_wax = ratio_ci(waxing)
-r_wan, ci_wan = ratio_ci(waning)
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Naissances totales", f"{df['births'].sum():,}")
-c2.metric("Lune montante — ratio", f"{r_wax:.2f}", help="garçons / 100 filles")
-c3.metric("Lune descendante — ratio", f"{r_wan:.2f}", help="garçons / 100 filles")
 delta = r_wax - r_wan
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Naissances totales", f"{df_births['births'].sum():,}")
+c2.metric("Ratio lune montante", f"{r_wax:.4f}", help="garçons / 100 filles")
+c3.metric("Ratio lune descendante", f"{r_wan:.4f}", help="garçons / 100 filles")
 c4.metric("Différence", f"{delta:+.4f}", help="Proche de 0 = aucun effet")
 
 st.divider()
@@ -141,15 +150,12 @@ with col_main:
     labels = ["Montante ↑", "Descendante ↓"]
     vals = [r_wax, r_wan]
     cis = [ci_wax, ci_wan]
-    colors = ["#f5c518", "#5b9bd5"]
 
-    bars = ax.bar(labels, vals, color=colors, width=0.4, zorder=3,
+    bars = ax.bar(labels, vals, color=["#f5c518", "#5b9bd5"], width=0.4, zorder=3,
                   yerr=cis, capsize=6, error_kw={"color": "white", "linewidth": 1.5})
     for bar, val in zip(bars, vals):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(cis) + 0.05,
-                f"{val:.4f}", ha="center", va="bottom",
-                color="white", fontsize=11, fontweight="bold")
-
+                f"{val:.4f}", ha="center", va="bottom", color="white", fontsize=11, fontweight="bold")
     ax.set_ylim(min(vals) - max(cis) - 1.5, max(vals) + max(cis) + 1.5)
     ax.set_ylabel("Garçons pour 100 filles", color="white", fontsize=10)
     ax.tick_params(colors="white", labelsize=11)
@@ -166,42 +172,35 @@ with col_verdict:
     if abs(delta) < 0.5:
         st.success(
             f"**Différence : {delta:+.4f} garçons / 100 filles**\n\n"
-            "Les barres d'erreur (IC 95%) se chevauchent largement. "
-            "La différence est pure **fluctuation statistique**.\n\n"
+            "Les barres d'erreur (IC 95%) se chevauchent. "
+            "Même avec une distribution de gestation réaliste, "
+            "la différence reste du **bruit statistique pur**.\n\n"
             "✅ **La lune montante/descendante n'influence pas le sexe du bébé.**"
         )
-    elif abs(delta) < 1.5:
-        st.warning(f"Différence faible ({delta:+.4f}) — probablement du bruit statistique.")
     else:
-        st.error(f"Différence notable ({delta:+.4f}) — inattendu, vérifier les données.")
+        st.warning(f"Différence ({delta:+.4f}) — inattendu avec ce volume de données.")
 
     st.markdown("---")
     st.markdown(f"""
-**Jours lune montante :** {waxing['conception_date'].nunique():,}
-**Jours lune descendante :** {waning['conception_date'].nunique():,}
-**Intervalle de confiance :** ±{ci_wax:.3f} (montante), ±{ci_wan:.3f} (descendante)
+**IC 95% montante :** ±{ci_wax:.4f}
+**IC 95% descendante :** ±{ci_wan:.4f}
+
+**Méthode :** chaque naissance distribuée sur 101 jours de conception pondérés (Jukic 2013 / CDC).
 """)
 
 st.divider()
 
 # ── Les 8 phases ──────────────────────────────────────────────────────────────
 
-st.subheader("Ratio garçons/filles pour chacune des 8 phases lunaires")
-st.caption("Si la lune avait un effet, on verrait une tendance claire — montant puis descendant ou inversement.")
+st.subheader("Ratio garçons/filles par phase lunaire")
+st.caption("Si la lune avait un effet, on verrait une tendance progressive montante → descendante. Les barres restent plates.")
 
 phase_data = []
 for phase in PHASE_ORDER:
-    sub = df[df["phase_name"] == phase]
-    if len(sub) == 0:
-        continue
-    r, ci = ratio_ci(sub)
-    phase_data.append({
-        "phase": phase,
-        "ratio": r,
-        "ci": ci,
-        "n_days": sub["conception_date"].nunique(),
-        "births": sub["births"].sum(),
-    })
+    d = phase_births.get(phase, {"M": 0.0, "F": 0.0})
+    r, ci = ratio_ci(d)
+    phase_data.append({"phase": phase, "ratio": r, "ci": ci,
+                        "births_M": d.get("M", 0.0), "births_F": d.get("F", 0.0)})
 
 fig2, ax2 = plt.subplots(figsize=(11, 4))
 fig2.patch.set_facecolor("#0f1117")
@@ -210,23 +209,22 @@ ax2.set_facecolor("#1a1d27")
 xs = range(len(phase_data))
 vals2 = [d["ratio"] for d in phase_data]
 cis2 = [d["ci"] for d in phase_data]
-colors2 = [PHASE_COLORS.get(d["phase"], "#888") for d in phase_data]
 
-bars2 = ax2.bar(xs, vals2, color=colors2, width=0.6, zorder=3,
+bars2 = ax2.bar(xs, vals2, color=PHASE_COLORS[:len(phase_data)], width=0.6, zorder=3,
                 yerr=cis2, capsize=5, error_kw={"color": "white", "linewidth": 1.2})
 for x, val in zip(xs, vals2):
-    ax2.text(x, val + max(cis2) + 0.08, f"{val:.2f}",
-             ha="center", va="bottom", color="white", fontsize=8)
+    ax2.text(x, val + max(cis2) + 0.01, f"{val:.4f}",
+             ha="center", va="bottom", color="white", fontsize=7.5)
 
-# Reference line = global average
-global_ratio = sex_ratio(df)
+global_ratio = sex_ratio({"M": sum(d["births_M"] for d in phase_data),
+                           "F": sum(d["births_F"] for d in phase_data)})
 ax2.axhline(global_ratio, color="#ff4b4b", linewidth=1.5, linestyle="--",
-            label=f"Moyenne globale : {global_ratio:.2f}")
+            label=f"Moyenne globale : {global_ratio:.4f}")
 
 ax2.set_xticks(xs)
 ax2.set_xticklabels([d["phase"] for d in phase_data],
                     rotation=25, ha="right", color="white", fontsize=9)
-ax2.set_ylim(min(vals2) - max(cis2) - 1.5, max(vals2) + max(cis2) + 1.5)
+ax2.set_ylim(min(vals2) - max(cis2) - 0.5, max(vals2) + max(cis2) + 0.3)
 ax2.set_ylabel("Garçons pour 100 filles", color="white", fontsize=10)
 ax2.tick_params(colors="white")
 for spine in ax2.spines.values():
@@ -238,29 +236,46 @@ plt.tight_layout()
 st.pyplot(fig2)
 plt.close(fig2)
 
-# Phase summary table
-st.markdown("**Détail par phase**")
-table = pd.DataFrame(phase_data).rename(columns={
-    "phase": "Phase", "ratio": "Ratio (G/100F)",
-    "ci": "±IC 95%", "n_days": "Jours", "births": "Naissances"
+# ── Table ─────────────────────────────────────────────────────────────────────
+
+table = pd.DataFrame(phase_data)[["phase", "ratio", "ci", "births_M", "births_F"]]
+table["total_weighted"] = table["births_M"] + table["births_F"]
+table = table.rename(columns={
+    "phase": "Phase", "ratio": "Ratio (G/100F)", "ci": "±IC 95%",
+    "births_M": "Garçons (pondéré)", "births_F": "Filles (pondéré)", "total_weighted": "Total pondéré"
 })
-table["Ratio (G/100F)"] = table["Ratio (G/100F)"].map("{:.4f}".format)
-table["±IC 95%"] = table["±IC 95%"].map("{:.4f}".format)
-table["Naissances"] = table["Naissances"].map("{:,}".format)
+for col in ["Ratio (G/100F)", "±IC 95%"]:
+    table[col] = table[col].map("{:.4f}".format)
+for col in ["Garçons (pondéré)", "Filles (pondéré)", "Total pondéré"]:
+    table[col] = table[col].map("{:,.0f}".format)
 st.dataframe(table.set_index("Phase"), use_container_width=True)
 
 st.divider()
 
-# ── Explorateur ───────────────────────────────────────────────────────────────
+# ── Distribution de gestation ─────────────────────────────────────────────────
 
-with st.expander("Explorer les données brutes"):
-    phase_filter = st.multiselect("Filtrer par phase", PHASE_ORDER, default=PHASE_ORDER)
-    gender_filter = st.radio("Genre", ["Tous", "M", "F"], horizontal=True)
-    filtered = df[df["phase_name"].isin(phase_filter)]
-    if gender_filter != "Tous":
-        filtered = filtered[filtered["gender"] == gender_filter]
-    st.dataframe(
-        filtered[["date", "gender", "births", "conception_date", "moon_phase", "is_waxing", "phase_name"]]
-        .sort_values("date"),
-        use_container_width=True, height=300,
-    )
+with st.expander("Distribution de gestation utilisée (Jukic 2013 / CDC)"):
+    gest = pd.read_csv("daily_gestation_probabilities.csv")
+    fig3, ax3 = plt.subplots(figsize=(9, 3))
+    fig3.patch.set_facecolor("#0f1117")
+    ax3.set_facecolor("#1a1d27")
+    ax3.fill_between(gest["jours_depuis_conception"], gest["probabilite"] * 100,
+                     alpha=0.5, color="#5b9bd5")
+    ax3.plot(gest["jours_depuis_conception"], gest["probabilite"] * 100,
+             color="#5b9bd5", linewidth=1.5)
+    peak = gest.loc[gest["probabilite"].idxmax()]
+    ax3.axvline(peak["jours_depuis_conception"], color="#f5c518", linewidth=1.2,
+                linestyle="--", label=f"Pic : j{int(peak['jours_depuis_conception'])} ({peak['probabilite']*100:.2f}%)")
+    ax3.set_xlabel("Jours depuis la conception", color="white", fontsize=9)
+    ax3.set_ylabel("Probabilité (%)", color="white", fontsize=9)
+    ax3.tick_params(colors="white", labelsize=8)
+    for spine in ax3.spines.values():
+        spine.set_edgecolor("#333")
+    ax3.yaxis.grid(True, color="#333", linestyle="--", linewidth=0.4)
+    ax3.set_axisbelow(True)
+    ax3.legend(facecolor="#1a1d27", labelcolor="white", fontsize=9)
+    plt.tight_layout()
+    st.pyplot(fig3)
+    plt.close(fig3)
+    st.dataframe(gest.rename(columns={"jours_depuis_conception": "Jours", "probabilite": "Probabilité"}),
+                 use_container_width=True, height=200)
