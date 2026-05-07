@@ -81,42 +81,59 @@ def compute_weighted(birth_dates_tuple):
     return phase_births
 
 
-@st.cache_data(show_spinner="Ages lunaires des jours de naissance…")
-def load_birth_lunar_ages(birth_dates_tuple):
-    LUNAR_CYCLE = 29.53059
-    result = {}
-    for bd in birth_dates_tuple:
-        d_str = bd.strftime("%Y/%m/%d")
-        prev_new = ephem.previous_new_moon(d_str)
-        result[bd] = float(ephem.Date(d_str) - prev_new) % LUNAR_CYCLE
-    return result
+@st.cache_data(show_spinner="Distribution par cycle lunaire (conception)…")
+def compute_conception_lunar_cycle(birth_dates_tuple, n_bins=30):
+    """
+    x-axis: lunar day at CONCEPTION.
+    Each birth is distributed across its 101 possible conception dates,
+    weighted by the gestation probability distribution.
 
+    Observed: weighted boys/girls per conception-lunar-day bin.
 
-@st.cache_data(show_spinner="Distribution par cycle lunaire…")
-def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30):
+    Theoretical (100% deterministic belief):
+      waxing conception → 100% boy, waning → 100% girl.
+      Total births (M+F) per date redistributed: all go to theo_M if waxing,
+      all go to theo_F if waning.
+    """
     df = _load_births()
     gest = pd.read_csv("daily_gestation_probabilities.csv")
     gest_w = dict(zip(gest["jours_depuis_conception"].astype(int), gest["probabilite"]))
     offsets = sorted(gest_w.keys())
     LUNAR_CYCLE = 29.53059
     moon_cache = load_moon_cache(birth_dates_tuple)
-    birth_ages = load_birth_lunar_ages(birth_dates_tuple)
 
     obs_M  = np.zeros(n_bins)
     obs_F  = np.zeros(n_bins)
     theo_M = np.zeros(n_bins)
     theo_F = np.zeros(n_bins)
 
+    # Total births per date (M+F) for the theoretical curve
+    total_per_date = df.groupby("date")["births"].sum().to_dict()
+
     for _, row in df.iterrows():
         bd, gender, births = row["date"], row["gender"], row["births"]
-        b_bin = min(int(birth_ages[bd] / LUNAR_CYCLE * n_bins), n_bins - 1)
-        if gender == "M":
-            obs_M[b_bin] += births
-        else:
-            obs_F[b_bin] += births
-        P_waxing = sum(gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1])
-        theo_M[b_bin] += births * P_waxing
-        theo_F[b_bin] += births * (1.0 - P_waxing)
+        for o in offsets:
+            cd = bd - timedelta(days=o)
+            w = gest_w[o]
+            _, is_waxing, _, lunar_age = moon_cache[cd]
+            idx = min(int(lunar_age / LUNAR_CYCLE * n_bins), n_bins - 1)
+            # Observed: distribute real births by actual gender
+            if gender == "M":
+                obs_M[idx] += births * w
+            else:
+                obs_F[idx] += births * w
+
+    # Theoretical: redistribute total births by waxing/waning at conception
+    for bd, total in total_per_date.items():
+        for o in offsets:
+            cd = bd - timedelta(days=o)
+            w = gest_w[o]
+            _, is_waxing, _, lunar_age = moon_cache[cd]
+            idx = min(int(lunar_age / LUNAR_CYCLE * n_bins), n_bins - 1)
+            if is_waxing:
+                theo_M[idx] += total * w
+            else:
+                theo_F[idx] += total * w
 
     return obs_M, obs_F, theo_M, theo_F
 
@@ -190,6 +207,89 @@ c1.metric("Naissances totales", f"{df_births['births'].sum():,}")
 c2.metric("Ratio lune montante",    f"{r_wax:.4f}", help="garçons / 100 filles")
 c3.metric("Ratio lune descendante", f"{r_wan:.4f}", help="garçons / 100 filles")
 c4.metric("Différence", f"{delta:+.4f}", help="Proche de 0 = aucun effet")
+
+st.divider()
+
+# ── Cycle lunaire jour par jour (EN PREMIER) ──────────────────────────────────
+
+st.subheader("Naissances observées vs théoriques par jour du cycle lunaire")
+st.caption(
+    "X-axis = jour du cycle lunaire à la **conception** (via distribution de gestation). "
+    "Chaque naissance est répartie sur ses 101 dates de conception possibles (200–300 j), "
+    "pondérées par la distribution de gestation réelle (Jukic 2013 / CDC). "
+    "Théorique = croyance 100% : lune montante → 100% garçon, descendante → 100% fille."
+)
+
+N_BINS = 30
+LUNAR_CYCLE = 29.53059
+
+obs_M, obs_F, theo_M, theo_F = compute_conception_lunar_cycle(birth_dates_tuple, N_BINS)
+
+bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
+
+def smooth(arr):
+    return np.array([np.mean(arr[np.arange(i - 1, i + 2) % N_BINS]) for i in range(N_BINS)])
+
+obs_M_s  = smooth(obs_M)
+obs_F_s  = smooth(obs_F)
+theo_M_s = smooth(theo_M)
+theo_F_s = smooth(theo_F)
+
+all_vals = np.concatenate([obs_M_s, obs_F_s, theo_M_s, theo_F_s])
+y_min = float(np.min(all_vals)) * 0.995
+y_max = float(np.max(all_vals)) * 1.005
+
+fig3 = go.Figure()
+
+fig3.add_vrect(x0=0, x1=LUNAR_CYCLE / 2,
+               fillcolor="#f5c518", opacity=0.06, layer="below", line_width=0,
+               annotation_text="← Montante →", annotation_position="top left",
+               annotation_font=dict(color="#f5c518", size=10))
+fig3.add_vrect(x0=LUNAR_CYCLE / 2, x1=LUNAR_CYCLE,
+               fillcolor="#5b9bd5", opacity=0.06, layer="below", line_width=0,
+               annotation_text="← Descendante →", annotation_position="top right",
+               annotation_font=dict(color="#5b9bd5", size=10))
+
+for x, label in [(0, "🌑"), (LUNAR_CYCLE/4, "🌓"), (LUNAR_CYCLE/2, "🌕"), (LUNAR_CYCLE*3/4, "🌗")]:
+    fig3.add_vline(x=x, line_color="#333", line_dash="dash", line_width=1,
+                   annotation_text=label, annotation_font_size=14, annotation_position="top")
+
+fig3.add_trace(go.Scatter(
+    x=bin_centers, y=obs_F_s, mode="lines+markers", name="Filles observées",
+    line=dict(color="#e91e8c", width=2.5), marker=dict(size=5, opacity=0.6),
+    hovertemplate="Jour conception %{x:.1f}<br>Filles obs. : %{y:,.0f}<extra></extra>",
+))
+fig3.add_trace(go.Scatter(
+    x=bin_centers, y=obs_M_s, mode="lines+markers", name="Garçons observés",
+    line=dict(color="#2196f3", width=2.5), marker=dict(size=5, opacity=0.6),
+    hovertemplate="Jour conception %{x:.1f}<br>Garçons obs. : %{y:,.0f}<extra></extra>",
+))
+fig3.add_trace(go.Scatter(
+    x=bin_centers, y=theo_F_s, mode="lines",
+    name="Filles théoriques (croyance 100% + gestation)",
+    line=dict(color="#f48fb1", width=2, dash="dash"),
+    hovertemplate="Jour conception %{x:.1f}<br>Filles théo. : %{y:,.0f}<extra></extra>",
+))
+fig3.add_trace(go.Scatter(
+    x=bin_centers, y=theo_M_s, mode="lines",
+    name="Garçons théoriques (croyance 100% + gestation)",
+    line=dict(color="#90caf9", width=2, dash="dash"),
+    hovertemplate="Jour conception %{x:.1f}<br>Garçons théo. : %{y:,.0f}<extra></extra>",
+))
+
+fig3.update_layout(
+    **dark_layout(height=500),
+    xaxis=dict(title="Jour du cycle lunaire à la conception", range=[0, LUNAR_CYCLE], gridcolor="#333"),
+    yaxis=dict(title="Naissances pondérées (lissées 3-bins)", range=[y_min, y_max], gridcolor="#333"),
+    legend=dict(bgcolor="#0d1020", bordercolor="#444", borderwidth=1,
+                font=dict(size=11), orientation="h", yanchor="bottom", y=-0.30, x=0),
+)
+st.plotly_chart(fig3, use_container_width=True)
+st.caption(
+    "Si la croyance était vraie : garçons théoriques (bleu tirets) devraient exploser en lune montante "
+    "et s'effondrer en descendante — et inversement pour les filles. "
+    "Les courbes observées (pleines) restent plates et identiques des deux côtés."
+)
 
 st.divider()
 
@@ -299,107 +399,6 @@ for col in ["Ratio (G/100F)", "±IC 95%"]:
 for col in ["Garçons (pondéré)", "Filles (pondéré)", "Total pondéré"]:
     table[col] = table[col].map("{:,.0f}".format)
 st.dataframe(table.set_index("Phase"), use_container_width=True)
-
-st.divider()
-
-# ── Cycle lunaire jour par jour ───────────────────────────────────────────────
-
-st.subheader("Ratio observé vs théorique sur le cycle lunaire complet")
-st.caption(
-    "X-axis = jour du cycle lunaire à la **naissance**. Chaque bin ≈ 1 jour (29.53 j / 30 bins). "
-    "Théorique = croyance 100% (montante→garçon, descendante→fille) convoluée avec la distribution de gestation réelle."
-)
-
-N_BINS = 30
-LUNAR_CYCLE = 29.53059
-
-obs_M, obs_F, theo_M, theo_F = compute_birth_lunar_cycle(birth_dates_tuple, N_BINS)
-
-bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
-
-# 3-bin circular smooth
-def smooth(arr):
-    return np.array([np.mean(arr[np.arange(i - 1, i + 2) % N_BINS]) for i in range(N_BINS)])
-
-obs_M_s  = smooth(obs_M)
-obs_F_s  = smooth(obs_F)
-theo_M_s = smooth(theo_M)
-theo_F_s = smooth(theo_F)
-
-# Y range: cover all 4 curves fully
-all_vals = np.concatenate([obs_M_s, obs_F_s, theo_M_s, theo_F_s])
-y_min = float(np.min(all_vals)) * 0.998
-y_max = float(np.max(all_vals)) * 1.002
-
-fig3 = go.Figure()
-
-# Background waxing / waning zones
-fig3.add_vrect(x0=0, x1=LUNAR_CYCLE / 2,
-               fillcolor="#f5c518", opacity=0.06, layer="below", line_width=0,
-               annotation_text="← Montante →", annotation_position="top left",
-               annotation_font=dict(color="#f5c518", size=10))
-fig3.add_vrect(x0=LUNAR_CYCLE / 2, x1=LUNAR_CYCLE,
-               fillcolor="#5b9bd5", opacity=0.06, layer="below", line_width=0,
-               annotation_text="← Descendante →", annotation_position="top right",
-               annotation_font=dict(color="#5b9bd5", size=10))
-
-# Phase markers
-for x, label in [(0, "🌑"), (LUNAR_CYCLE/4, "🌓"),
-                 (LUNAR_CYCLE/2, "🌕"), (LUNAR_CYCLE*3/4, "🌗")]:
-    fig3.add_vline(x=x, line_color="#333", line_dash="dash", line_width=1,
-                   annotation_text=label, annotation_font_size=14,
-                   annotation_position="top")
-
-# Observed girls
-fig3.add_trace(go.Scatter(
-    x=bin_centers, y=obs_F_s,
-    mode="lines+markers", name="Filles observées",
-    line=dict(color="#e91e8c", width=2.5),
-    marker=dict(size=5, opacity=0.6),
-    hovertemplate="Jour %{x:.1f}<br>Filles obs. : %{y:,.0f}<extra></extra>",
-))
-
-# Observed boys
-fig3.add_trace(go.Scatter(
-    x=bin_centers, y=obs_M_s,
-    mode="lines+markers", name="Garçons observés",
-    line=dict(color="#2196f3", width=2.5),
-    marker=dict(size=5, opacity=0.6),
-    hovertemplate="Jour %{x:.1f}<br>Garçons obs. : %{y:,.0f}<extra></extra>",
-))
-
-# Theoretical girls (100% belief + gestation)
-fig3.add_trace(go.Scatter(
-    x=bin_centers, y=theo_F_s,
-    mode="lines", name="Filles théoriques (croyance 100% + gestation)",
-    line=dict(color="#f48fb1", width=2, dash="dash"),
-    hovertemplate="Jour %{x:.1f}<br>Filles théo. : %{y:,.0f}<extra></extra>",
-))
-
-# Theoretical boys (100% belief + gestation)
-fig3.add_trace(go.Scatter(
-    x=bin_centers, y=theo_M_s,
-    mode="lines", name="Garçons théoriques (croyance 100% + gestation)",
-    line=dict(color="#90caf9", width=2, dash="dash"),
-    hovertemplate="Jour %{x:.1f}<br>Garçons théo. : %{y:,.0f}<extra></extra>",
-))
-
-fig3.update_layout(
-    **dark_layout(height=500),
-    xaxis=dict(title="Jour du cycle lunaire (à la naissance)", range=[0, LUNAR_CYCLE], gridcolor="#333"),
-    yaxis=dict(title="Naissances (pondérées, lissées 3-bins)", range=[y_min, y_max], gridcolor="#333"),
-    legend=dict(
-        bgcolor="#0d1020", bordercolor="#444", borderwidth=1,
-        font=dict(size=11), orientation="h", yanchor="bottom", y=-0.30, x=0,
-    ),
-)
-st.plotly_chart(fig3, use_container_width=True)
-st.caption(
-    "Si la croyance était vraie, les courbes théoriques (tirets) devraient diverger clairement "
-    "des courbes observées entre lune montante et descendante. "
-    "La fenêtre de gestation (200–300 j ≈ 3.4 cycles lunaires) brouille quasi-totalement le signal : "
-    "les courbes théoriques et observées sont indiscernables."
-)
 
 st.divider()
 
