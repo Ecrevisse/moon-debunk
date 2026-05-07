@@ -75,32 +75,81 @@ def compute_weighted(birth_dates_tuple):
     return phase_births
 
 
-@st.cache_data(show_spinner="Distribution par cycle lunaire…")
-def compute_lunar_cycle(birth_dates_tuple, n_bins=30):
-    """Aggregate weighted births into n_bins across the 29.53-day lunar cycle."""
+@st.cache_data(show_spinner="Ages lunaires des jours de naissance…")
+def load_birth_lunar_ages(birth_dates_tuple):
+    """Lunar age (day in cycle) for each birth date."""
+    LUNAR_CYCLE = 29.53059
+    result = {}
+    for bd in birth_dates_tuple:
+        d_str = bd.strftime("%Y/%m/%d")
+        prev_new = ephem.previous_new_moon(d_str)
+        result[bd] = float(ephem.Date(d_str) - prev_new) % LUNAR_CYCLE
+    return result
+
+
+@st.cache_data(show_spinner="Distribution par cycle lunaire (jour de naissance)…")
+def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
+    """
+    x-axis: birth lunar day.
+
+    Returns observed ratio per bin, plus two theoretical curves:
+    - naive: step function applied to birth lunar day (no gestation)
+    - correct: convolution of theory with gestation distribution
+      P_waxing(birth_date) = gestation-weighted fraction of conception window that is waxing
+      → nearly flat because the window spans ~3.4 lunar cycles
+    """
     df = _load_births()
     gest = pd.read_csv("daily_gestation_probabilities.csv")
     gest_w = dict(zip(gest["jours_depuis_conception"].astype(int), gest["probabilite"]))
     offsets = sorted(gest_w.keys())
-    moon_cache = load_moon_cache(birth_dates_tuple)
-
     LUNAR_CYCLE = 29.53059
-    bins_M = np.zeros(n_bins)
-    bins_F = np.zeros(n_bins)
+
+    moon_cache = load_moon_cache(birth_dates_tuple)
+    birth_ages = load_birth_lunar_ages(birth_dates_tuple)
+
+    total_M = df.loc[df["gender"] == "M", "births"].sum()
+    total_F = df.loc[df["gender"] == "F", "births"].sum()
+    global_p = total_M / (total_M + total_F)  # ≈ 0.512
+
+    obs_M    = np.zeros(n_bins)
+    obs_F    = np.zeros(n_bins)
+    theo_M   = np.zeros(n_bins)  # correct: with gestation distribution
+    theo_F   = np.zeros(n_bins)
+    naive_M  = np.zeros(n_bins)  # naive: step at birth lunar day
+    naive_F  = np.zeros(n_bins)
 
     for _, row in df.iterrows():
         bd, gender, births = row["date"], row["gender"], row["births"]
-        for o in offsets:
-            cd = bd - timedelta(days=o)
-            w = gest_w[o]
-            lunar_age = moon_cache[cd][3]
-            idx = min(int(lunar_age / LUNAR_CYCLE * n_bins), n_bins - 1)
-            if gender == "M":
-                bins_M[idx] += births * w
-            else:
-                bins_F[idx] += births * w
 
-    return bins_M, bins_F
+        b_age = birth_ages[bd]
+        b_bin = min(int(b_age / LUNAR_CYCLE * n_bins), n_bins - 1)
+
+        # ── Observed ─────────────────────────────────────────────────────────
+        if gender == "M":
+            obs_M[b_bin] += births
+        else:
+            obs_F[b_bin] += births
+
+        # ── Correct theoretical ───────────────────────────────────────────────
+        # P_waxing: fraction of conception window (j=200..300) that is waxing,
+        # weighted by gestation probability. gest weights sum to 1.
+        P_waxing = sum(
+            gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1]
+        )
+        # Under theory: P(boy) = global_p + delta*(2*P_waxing - 1)
+        # P_waxing ≈ 0.5 for all birth dates → effect nearly vanishes
+        p_boy_theo = float(np.clip(global_p + effect_delta * (2 * P_waxing - 1), 0, 1))
+        theo_M[b_bin] += births * p_boy_theo
+        theo_F[b_bin] += births * (1 - p_boy_theo)
+
+        # ── Naive theoretical ─────────────────────────────────────────────────
+        # Applies the theory to the BIRTH lunar day (ignores gestation entirely)
+        birth_is_waxing = b_age <= LUNAR_CYCLE / 2
+        p_boy_naive = float(np.clip(global_p + effect_delta * (1 if birth_is_waxing else -1), 0, 1))
+        naive_M[b_bin] += births * p_boy_naive
+        naive_F[b_bin] += births * (1 - p_boy_naive)
+
+    return obs_M, obs_F, theo_M, theo_F, naive_M, naive_F
 
 
 @st.cache_data
@@ -291,111 +340,126 @@ st.divider()
 
 st.subheader("Ratio observé vs théorique sur le cycle lunaire complet")
 st.caption(
-    "Chaque bin ≈ 1 jour de cycle lunaire (29.53 j / 30 bins). "
-    "Naissances pondérées par la distribution de gestation. "
-    "La courbe théorique représente ce qu'on devrait observer si la croyance était vraie."
+    "X-axis = jour du cycle lunaire à la **naissance**. Chaque bin ≈ 1 jour (29.53 j / 30 bins). "
+    "La courbe théorique **correcte** propage l'effet à travers la distribution de gestation : "
+    "la fenêtre de conception couvre ~3.4 cycles lunaires, ce qui brouille quasi-totalement le signal."
 )
 
 N_BINS = 30
 LUNAR_CYCLE = 29.53059
 
-bins_M, bins_F = compute_lunar_cycle(birth_dates_tuple, N_BINS)
-bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
-bin_total = bins_M + bins_F
-
-# Observed ratio + CI
-obs_ratio = np.where(bins_F > 0, bins_M / bins_F * 100, np.nan)
-obs_ci = np.where(
-    bin_total > 0,
-    1.96 * np.sqrt((bins_M / bin_total) * (bins_F / bin_total) / bin_total) * 100 / (bins_F / bin_total),
-    np.nan,
+# Sidebar: effect size
+effect_delta = st.sidebar.slider(
+    "Effet théorique Δ (probabilité garçon)", min_value=0.01, max_value=0.20,
+    value=0.05, step=0.01,
+    help="Δ = shift absolu de P(garçon). Ex: Δ=0.05 → P(garçon|lune montante)=56%, P(garçon|lune descendante)=46%"
 )
 
-# Smoothed observed (3-bin rolling average, circular)
+obs_M, obs_F, theo_M, theo_F, naive_M, naive_F = compute_birth_lunar_cycle(
+    birth_dates_tuple, N_BINS, effect_delta
+)
+
+bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
+bin_total_obs = obs_M + obs_F
+
+def to_ratio(M, F):
+    return np.where(F > 0, M / F * 100, np.nan)
+
+def to_ci(M, F):
+    n = M + F
+    p = np.where(n > 0, M / n, 0.512)
+    return np.where(n > 0, 1.96 * np.sqrt(p * (1 - p) / n) * 100 / np.where(F > 0, F / n, 1), np.nan)
+
+obs_ratio   = to_ratio(obs_M, obs_F)
+theo_ratio  = to_ratio(theo_M, theo_F)
+naive_ratio = to_ratio(naive_M, naive_F)
+obs_ci      = to_ci(obs_M, obs_F)
+
+# Smoothed observed (3-bin circular rolling average)
 obs_smooth = np.array([
     np.nanmean(obs_ratio[np.arange(i - 1, i + 2) % N_BINS]) for i in range(N_BINS)
 ])
 
-# Global average
-global_avg = (bins_M.sum() / bins_F.sum()) * 100
+global_avg = float(np.nansum(obs_M) / np.nansum(obs_F) * 100)
+obs_std    = float(np.nanstd(obs_ratio))
 
-# Theoretical curve: step function waxing → boys (+effect), waning → girls (-effect)
-# Effect size = 3× the observed std across bins (illustrative but larger than anything real)
-obs_std = np.nanstd(obs_ratio)
-effect_size = max(3.0, obs_std * 4)  # at least 3 boys/100 girls amplitude
-waxing_mask = bin_centers <= LUNAR_CYCLE / 2
-theoretical = np.where(waxing_mask, global_avg + effect_size, global_avg - effect_size)
+# Naive amplitude (ratio shift) for annotation
+naive_amp = float(np.nanmax(naive_ratio) - np.nanmin(naive_ratio))
+theo_amp  = float(np.nanmax(theo_ratio)  - np.nanmin(theo_ratio))
 
-fig_cycle, ax_c = plt.subplots(figsize=(12, 5))
+fig_cycle, ax_c = plt.subplots(figsize=(12, 5.5))
 fig_cycle.patch.set_facecolor("#0f1117")
 ax_c.set_facecolor("#1a1d27")
 
-# Background: waxing / waning zones
-ax_c.axvspan(0, LUNAR_CYCLE / 2, alpha=0.08, color="#f5c518", label="_nolegend_")
-ax_c.axvspan(LUNAR_CYCLE / 2, LUNAR_CYCLE, alpha=0.08, color="#5b9bd5", label="_nolegend_")
-ax_c.text(LUNAR_CYCLE * 0.25, ax_c.get_ylim()[0] if False else global_avg - effect_size - 1.2,
-          "← Lune montante →", ha="center", color="#f5c518aa", fontsize=8)
-ax_c.text(LUNAR_CYCLE * 0.75, global_avg - effect_size - 1.2,
-          "← Lune descendante →", ha="center", color="#5b9bdaaa", fontsize=8)
+# Background waxing / waning
+ax_c.axvspan(0, LUNAR_CYCLE / 2, alpha=0.07, color="#f5c518")
+ax_c.axvspan(LUNAR_CYCLE / 2, LUNAR_CYCLE, alpha=0.07, color="#5b9bd5")
 
-# Sample size bars (secondary y-axis, faint)
+# Sample size bars (secondary axis)
 ax2_c = ax_c.twinx()
-ax2_c.bar(bin_centers, bin_total / 1e6, width=LUNAR_CYCLE / N_BINS * 0.8,
-          color="#ffffff", alpha=0.06, zorder=1)
-ax2_c.set_ylabel("Naissances pondérées (M)", color="#555", fontsize=8)
-ax2_c.tick_params(colors="#555", labelsize=7)
-ax2_c.set_ylim(0, bin_total.max() / 1e6 * 6)  # keep bars small vs main curves
+ax2_c.bar(bin_centers, bin_total_obs / 1e6, width=LUNAR_CYCLE / N_BINS * 0.75,
+          color="#ffffff", alpha=0.05, zorder=1)
+ax2_c.set_ylabel("Naissances (M)", color="#444", fontsize=8)
+ax2_c.tick_params(colors="#444", labelsize=7)
+ax2_c.set_ylim(0, bin_total_obs.max() / 1e6 * 8)
 
-# Global average
-ax_c.axhline(global_avg, color="#ff4b4b", linewidth=1.2, linestyle=":",
+# Global mean
+ax_c.axhline(global_avg, color="#ff4b4b", linewidth=1.1, linestyle=":",
              label=f"Moyenne globale : {global_avg:.3f}", zorder=3)
 
-# Theoretical
-ax_c.step(np.append(bin_centers - LUNAR_CYCLE / N_BINS / 2, LUNAR_CYCLE),
-          np.append(theoretical, theoretical[-1]),
-          where="post", color="#ff9500", linewidth=2, linestyle="--",
-          label=f"Théorique (±{effect_size:.1f} g/100f si croyance vraie)", zorder=4)
+# Naive theoretical (step function — ignores gestation)
+ax_c.plot(bin_centers, naive_ratio, color="#ff9500", linewidth=2.0,
+          linestyle="--", label=f"Théorique naïf (Δ={effect_delta}, sans distribution gestation) — amplitude {naive_amp:.2f}", zorder=4)
 
-# CI band (observed)
-ax_c.fill_between(bin_centers,
-                  obs_ratio - obs_ci, obs_ratio + obs_ci,
-                  color="#4caf50", alpha=0.18, zorder=2, label="IC 95% observé")
+# Correct theoretical (with gestation — nearly flat)
+ax_c.plot(bin_centers, theo_ratio, color="#e040fb", linewidth=2.2,
+          linestyle="-", label=f"Théorique correct (avec distribution gestation) — amplitude {theo_amp:.4f}", zorder=5)
 
-# Observed raw (faint dots)
-ax_c.scatter(bin_centers, obs_ratio, color="#4caf50", s=18, alpha=0.5, zorder=5)
+# CI band observed
+ax_c.fill_between(bin_centers, obs_ratio - obs_ci, obs_ratio + obs_ci,
+                  color="#4caf50", alpha=0.15, zorder=2)
+
+# Observed raw dots
+ax_c.scatter(bin_centers, obs_ratio, color="#4caf50", s=16, alpha=0.45, zorder=5)
 
 # Smoothed observed
 ax_c.plot(bin_centers, obs_smooth, color="#4caf50", linewidth=2.2,
-          label="Observé (lissé 3-bins)", zorder=6)
+          label=f"Observé lissé + IC 95% (σ={obs_std:.3f})", zorder=6)
 
-# Moon phase markers on x-axis
-MOON_MARKERS = [(0, "🌑"), (LUNAR_CYCLE / 4, "🌓"), (LUNAR_CYCLE / 2, "🌕"), (LUNAR_CYCLE * 3 / 4, "🌗")]
-for x, symbol in MOON_MARKERS:
-    ax_c.axvline(x, color="#444", linewidth=0.8, linestyle="--", zorder=1)
-    ax_c.text(x, ax_c.get_ylim()[0] if False else global_avg + effect_size + 0.3,
-              symbol, ha="center", fontsize=13, zorder=7)
+# Moon markers
+for x, sym in [(0, "🌑"), (LUNAR_CYCLE / 4, "🌓"), (LUNAR_CYCLE / 2, "🌕"), (LUNAR_CYCLE * 3 / 4, "🌗")]:
+    ax_c.axvline(x, color="#333", linewidth=0.8, linestyle="--", zorder=1)
+    ax_c.text(x, global_avg + naive_amp / 2 + 0.4, sym, ha="center", fontsize=13, zorder=7)
 
-# Annotation: observed std vs theoretical amplitude
+# Annotation
+ratio_reduction = (1 - theo_amp / naive_amp) * 100 if naive_amp > 0 else 0
 ax_c.annotate(
-    f"Écart-type observé : {obs_std:.3f}\n"
-    f"Effet théorique : ±{effect_size:.1f}\n"
-    f"→ Théorique = {effect_size / obs_std:.0f}× le bruit réel",
-    xy=(LUNAR_CYCLE * 0.55, global_avg + effect_size * 0.6),
-    fontsize=8.5, color="white",
-    bbox=dict(boxstyle="round,pad=0.4", facecolor="#1a1d27", edgecolor="#555"),
+    f"Amplitude naïve (sans gestation) : {naive_amp:.2f} g/100f\n"
+    f"Amplitude correcte (avec gestation) : {theo_amp:.4f} g/100f\n"
+    f"→ La distribution de gestation réduit le signal de {ratio_reduction:.0f}%\n"
+    f"   Même si la théorie est vraie, le signal est indétectable.",
+    xy=(LUNAR_CYCLE * 0.01, global_avg - naive_amp / 2 - 0.3),
+    fontsize=8.5, color="white", va="top",
+    bbox=dict(boxstyle="round,pad=0.5", facecolor="#0d1020", edgecolor="#555"),
 )
 
-ax_c.set_xlabel("Jour du cycle lunaire", color="white", fontsize=10)
+# Labels / waxing / waning text
+ax_c.text(LUNAR_CYCLE * 0.25, global_avg + naive_amp / 2 + 0.1,
+          "← Lune montante →", ha="center", color="#f5c518", fontsize=8, alpha=0.7)
+ax_c.text(LUNAR_CYCLE * 0.75, global_avg + naive_amp / 2 + 0.1,
+          "← Lune descendante →", ha="center", color="#5b9bd5", fontsize=8, alpha=0.7)
+
+ax_c.set_xlabel("Jour du cycle lunaire (à la naissance)", color="white", fontsize=10)
 ax_c.set_ylabel("Garçons pour 100 filles", color="white", fontsize=10)
 ax_c.set_xlim(0, LUNAR_CYCLE)
-y_margin = effect_size + max(obs_ci[~np.isnan(obs_ci)]) + 1
-ax_c.set_ylim(global_avg - y_margin, global_avg + y_margin + 2)
+y_margin = naive_amp / 2 + max(obs_ci[~np.isnan(obs_ci)]) + 1
+ax_c.set_ylim(global_avg - y_margin - 0.5, global_avg + y_margin + 1.5)
 ax_c.tick_params(colors="white")
 for spine in ax_c.spines.values():
     spine.set_edgecolor("#333")
 ax_c.yaxis.grid(True, color="#333", linestyle="--", linewidth=0.4, zorder=0)
 ax_c.set_axisbelow(True)
-ax_c.legend(facecolor="#1a1d27", labelcolor="white", fontsize=9, loc="lower right")
+ax_c.legend(facecolor="#0d1020", labelcolor="white", fontsize=8.5, loc="lower right")
 plt.tight_layout()
 st.pyplot(fig_cycle)
 plt.close(fig_cycle)
