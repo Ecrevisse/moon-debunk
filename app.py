@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import ephem
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import timedelta
 
 st.set_page_config(page_title="Lune & Sexe du Bébé — Debunker", layout="wide")
@@ -11,10 +10,6 @@ st.set_page_config(page_title="Lune & Sexe du Bébé — Debunker", layout="wide
 PHASE_ORDER = [
     "Nouvelle lune", "Croissant montant", "Premier quartier", "Gibbeuse montante",
     "Pleine lune", "Gibbeuse descendante", "Dernier quartier", "Croissant descendant",
-]
-PHASE_COLORS = [
-    "#555", "#6a7fb5", "#5b9bd5", "#a8c8f0",
-    "#f5c518", "#d4a017", "#c08000", "#8a6000",
 ]
 WAXING_PHASES = {"Nouvelle lune", "Croissant montant", "Premier quartier", "Gibbeuse montante"}
 
@@ -81,19 +76,23 @@ def compute_weighted(birth_dates_tuple):
     return phase_births
 
 
-@st.cache_data(show_spinner="Distribution par cycle lunaire (conception)…")
-def compute_conception_lunar_cycle(birth_dates_tuple, n_bins=30):
+@st.cache_data(show_spinner="Ages lunaires des jours de naissance…")
+def load_birth_lunar_ages(birth_dates_tuple):
+    LUNAR_CYCLE = 29.53059
+    result = {}
+    for bd in birth_dates_tuple:
+        d_str = bd.strftime("%Y/%m/%d")
+        prev_new = ephem.previous_new_moon(d_str)
+        result[bd] = float(ephem.Date(d_str) - prev_new) % LUNAR_CYCLE
+    return result
+
+
+@st.cache_data(show_spinner="Distribution par cycle lunaire…")
+def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30):
     """
-    x-axis: lunar day at CONCEPTION.
-    Each birth is distributed across its 101 possible conception dates,
-    weighted by the gestation probability distribution.
-
-    Observed: weighted boys/girls per conception-lunar-day bin.
-
-    Theoretical (100% deterministic belief):
-      waxing conception → 100% boy, waning → 100% girl.
-      Total births (M+F) per date redistributed: all go to theo_M if waxing,
-      all go to theo_F if waning.
+    x-axis: birth lunar day.
+    Theoretical: P_waxing(bd) = gestation-weighted fraction of 101 conception
+    days that are waxing. Always ∈ [0.40, 0.57] — never 0 or 1.
     """
     df = _load_births()
     gest = pd.read_csv("daily_gestation_probabilities.csv")
@@ -101,39 +100,27 @@ def compute_conception_lunar_cycle(birth_dates_tuple, n_bins=30):
     offsets = sorted(gest_w.keys())
     LUNAR_CYCLE = 29.53059
     moon_cache = load_moon_cache(birth_dates_tuple)
+    birth_ages = load_birth_lunar_ages(birth_dates_tuple)
+    total_per_date = df.groupby("date")["births"].sum().to_dict()
 
     obs_M  = np.zeros(n_bins)
     obs_F  = np.zeros(n_bins)
     theo_M = np.zeros(n_bins)
     theo_F = np.zeros(n_bins)
 
-    # Total births per date (M+F) for the theoretical curve
-    total_per_date = df.groupby("date")["births"].sum().to_dict()
-
     for _, row in df.iterrows():
         bd, gender, births = row["date"], row["gender"], row["births"]
-        for o in offsets:
-            cd = bd - timedelta(days=o)
-            w = gest_w[o]
-            _, is_waxing, _, lunar_age = moon_cache[cd]
-            idx = min(int(lunar_age / LUNAR_CYCLE * n_bins), n_bins - 1)
-            # Observed: distribute real births by actual gender
-            if gender == "M":
-                obs_M[idx] += births * w
-            else:
-                obs_F[idx] += births * w
+        b_bin = min(int(birth_ages[bd] / LUNAR_CYCLE * n_bins), n_bins - 1)
+        if gender == "M":
+            obs_M[b_bin] += births
+        else:
+            obs_F[b_bin] += births
 
-    # Theoretical: redistribute total births by waxing/waning at conception
     for bd, total in total_per_date.items():
-        for o in offsets:
-            cd = bd - timedelta(days=o)
-            w = gest_w[o]
-            _, is_waxing, _, lunar_age = moon_cache[cd]
-            idx = min(int(lunar_age / LUNAR_CYCLE * n_bins), n_bins - 1)
-            if is_waxing:
-                theo_M[idx] += total * w
-            else:
-                theo_F[idx] += total * w
+        b_bin = min(int(birth_ages[bd] / LUNAR_CYCLE * n_bins), n_bins - 1)
+        P_waxing = sum(gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1])
+        theo_M[b_bin] += total * P_waxing
+        theo_F[b_bin] += total * (1.0 - P_waxing)
 
     return obs_M, obs_F, theo_M, theo_F
 
@@ -152,9 +139,10 @@ def _load_births():
     return df.dropna(subset=["date"])
 
 
-def sex_ratio(d):
+def pct_boys(d):
     m, f = d.get("M", 0.0), d.get("F", 0.0)
-    return (m / f) * 100 if f > 0 else 0.0
+    n = m + f
+    return (m / n) * 100 if n > 0 else 0.0
 
 def ratio_ci(d):
     import math
@@ -166,19 +154,11 @@ def ratio_ci(d):
     margin = 1.96 * math.sqrt(p * (1 - p) / n) * 100 / (f / n)
     return (m / f) * 100, margin
 
-def to_ratio(M, F):
-    return np.where(F > 0, M / F * 100, np.nan)
-
-def to_ci(M, F):
-    n = M + F
-    p = np.where(n > 0, M / n, 0.512)
-    return np.where(n > 0, 1.96 * np.sqrt(p * (1 - p) / n) * 100 / np.where(F > 0, F / n, 1), np.nan)
-
 # ── Load ──────────────────────────────────────────────────────────────────────
 
 df_births = _load_births()
 birth_dates_tuple = tuple(sorted(df_births["date"].unique()))
-phase_births = compute_weighted(birth_dates_tuple)
+phase_births      = compute_weighted(birth_dates_tuple)
 
 waxing_agg = {"M": 0.0, "F": 0.0}
 waning_agg = {"M": 0.0, "F": 0.0}
@@ -189,6 +169,9 @@ for phase, gdict in phase_births.items():
 
 r_wax, ci_wax = ratio_ci(waxing_agg)
 r_wan, ci_wan = ratio_ci(waning_agg)
+obs_wax_pct   = pct_boys(waxing_agg)
+obs_wan_pct   = pct_boys(waning_agg)
+delta_obs     = obs_wax_pct - obs_wan_pct
 
 # ── Header ────────────────────────────────────────────────────────────────────
 
@@ -201,29 +184,31 @@ st.markdown(
 
 # ── KPIs ──────────────────────────────────────────────────────────────────────
 
-delta = r_wax - r_wan
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Naissances totales", f"{df_births['births'].sum():,}")
-c2.metric("Ratio lune montante",    f"{r_wax:.4f}", help="garçons / 100 filles")
-c3.metric("Ratio lune descendante", f"{r_wan:.4f}", help="garçons / 100 filles")
-c4.metric("Différence", f"{delta:+.4f}", help="Proche de 0 = aucun effet")
+c2.metric("% garçons — conception montante",    f"{obs_wax_pct:.3f}%",
+          help="Naissances dont la conception pondérée tombe en lune montante")
+c3.metric("% garçons — conception descendante", f"{obs_wan_pct:.3f}%",
+          help="Naissances dont la conception pondérée tombe en lune descendante")
+c4.metric("Écart observé", f"{delta_obs:+.4f}%", help="Proche de 0 = aucun effet détectable")
 
 st.divider()
 
-# ── Cycle lunaire jour par jour (EN PREMIER) ──────────────────────────────────
+# ── Cycle lunaire jour par jour ────────────────────────────────────────────────
 
 st.subheader("Naissances observées vs théoriques par jour du cycle lunaire")
 st.caption(
-    "X-axis = jour du cycle lunaire à la **conception** (via distribution de gestation). "
-    "Chaque naissance est répartie sur ses 101 dates de conception possibles (200–300 j), "
-    "pondérées par la distribution de gestation réelle (Jukic 2013 / CDC). "
-    "Théorique = croyance 100% : lune montante → 100% garçon, descendante → 100% fille."
+    "X-axis = jour du cycle lunaire à la **naissance** (0 = nouvelle lune, ~14.8 = pleine lune). "
+    "**Observé** : naissances réelles M/F (CDC). "
+    "**Théorique** : croyance 100% (montante → garçon, descendante → fille) corrigée pour la distribution "
+    "de gestation réelle — P_waxing(date_naissance) ∈ [0.40, 0.57] car la fenêtre de conception "
+    "de 101 jours couvre ≈ 3.4 cycles lunaires, donc jamais 0% ou 100%."
 )
 
 N_BINS = 30
 LUNAR_CYCLE = 29.53059
 
-obs_M, obs_F, theo_M, theo_F = compute_conception_lunar_cycle(birth_dates_tuple, N_BINS)
+obs_M, obs_F, theo_M, theo_F = compute_birth_lunar_cycle(birth_dates_tuple, N_BINS)
 
 bin_centers = np.array([(i + 0.5) * LUNAR_CYCLE / N_BINS for i in range(N_BINS)])
 
@@ -235,9 +220,7 @@ obs_F_s  = smooth(obs_F)
 theo_M_s = smooth(theo_M)
 theo_F_s = smooth(theo_F)
 
-all_vals = np.concatenate([obs_M_s, obs_F_s, theo_M_s, theo_F_s])
-y_min = float(np.min(all_vals)) * 0.995
-y_max = float(np.max(all_vals)) * 1.005
+y_max = float(np.max(np.concatenate([obs_M_s, obs_F_s, theo_M_s, theo_F_s]))) * 1.06
 
 fig3 = go.Figure()
 
@@ -257,32 +240,32 @@ for x, label in [(0, "🌑"), (LUNAR_CYCLE/4, "🌓"), (LUNAR_CYCLE/2, "🌕"), 
 fig3.add_trace(go.Scatter(
     x=bin_centers, y=obs_F_s, mode="lines+markers", name="Filles observées",
     line=dict(color="#e91e8c", width=2.5), marker=dict(size=5, opacity=0.6),
-    hovertemplate="Jour conception %{x:.1f}<br>Filles obs. : %{y:,.0f}<extra></extra>",
+    hovertemplate="Jour naissance %{x:.1f}<br>Filles obs. : %{y:,.0f}<extra></extra>",
 ))
 fig3.add_trace(go.Scatter(
     x=bin_centers, y=obs_M_s, mode="lines+markers", name="Garçons observés",
     line=dict(color="#2196f3", width=2.5), marker=dict(size=5, opacity=0.6),
-    hovertemplate="Jour conception %{x:.1f}<br>Garçons obs. : %{y:,.0f}<extra></extra>",
+    hovertemplate="Jour naissance %{x:.1f}<br>Garçons obs. : %{y:,.0f}<extra></extra>",
 ))
 fig3.add_trace(go.Scatter(
     x=bin_centers, y=theo_F_s, mode="lines",
-    name="Filles théoriques (croyance 100% + gestation)",
+    name="Filles théoriques (croyance + gestation)",
     line=dict(color="#f48fb1", width=2, dash="dash"),
-    hovertemplate="Jour conception %{x:.1f}<br>Filles théo. : %{y:,.0f}<extra></extra>",
+    hovertemplate="Jour naissance %{x:.1f}<br>Filles théo. : %{y:,.0f}<extra></extra>",
 ))
 fig3.add_trace(go.Scatter(
     x=bin_centers, y=theo_M_s, mode="lines",
-    name="Garçons théoriques (croyance 100% + gestation)",
+    name="Garçons théoriques (croyance + gestation)",
     line=dict(color="#90caf9", width=2, dash="dash"),
-    hovertemplate="Jour conception %{x:.1f}<br>Garçons théo. : %{y:,.0f}<extra></extra>",
+    hovertemplate="Jour naissance %{x:.1f}<br>Garçons théo. : %{y:,.0f}<extra></extra>",
 ))
 
 fig3.update_layout(
-    **dark_layout(height=500),
-    xaxis=dict(title="Jour du cycle lunaire à la conception", range=[0, LUNAR_CYCLE], gridcolor="#333"),
-    yaxis=dict(title="Naissances pondérées (lissées 3-bins)", range=[y_min, y_max], gridcolor="#333"),
+    **dark_layout(height=620),
+    xaxis=dict(title="Jour du cycle lunaire à la naissance", range=[0, LUNAR_CYCLE], gridcolor="#333"),
+    yaxis=dict(title="Naissances pondérées (lissées 3-bins)", range=[0, y_max], gridcolor="#333"),
     legend=dict(bgcolor="#0d1020", bordercolor="#444", borderwidth=1,
-                font=dict(size=11), orientation="h", yanchor="bottom", y=-0.30, x=0),
+                font=dict(size=11), orientation="h", yanchor="bottom", y=-0.22, x=0),
 )
 st.plotly_chart(fig3, use_container_width=True)
 st.caption(
@@ -290,115 +273,6 @@ st.caption(
     "et s'effondrer en descendante — et inversement pour les filles. "
     "Les courbes observées (pleines) restent plates et identiques des deux côtés."
 )
-
-st.divider()
-
-# ── Montante vs Descendante ───────────────────────────────────────────────────
-
-col_main, col_verdict = st.columns([1.6, 1])
-
-with col_main:
-    st.subheader("Lune montante vs descendante")
-
-    fig1 = go.Figure()
-    for label, val, ci, color in [
-        ("Montante ↑",    r_wax, ci_wax, "#f5c518"),
-        ("Descendante ↓", r_wan, ci_wan, "#5b9bd5"),
-    ]:
-        fig1.add_trace(go.Bar(
-            x=[label], y=[val],
-            error_y=dict(type="data", array=[ci], visible=True, color="white", thickness=2),
-            marker_color=color,
-            text=[f"{val:.4f}"], textposition="outside", textfont=dict(color="white", size=13),
-            width=0.4, name=label,
-        ))
-    y_min = min(r_wax, r_wan) - max(ci_wax, ci_wan) - 1.5
-    y_max = max(r_wax, r_wan) + max(ci_wax, ci_wan) + 1.5
-    fig1.update_layout(
-        **dark_layout(height=380, showlegend=False, bargap=0.4),
-        yaxis=dict(title="Garçons pour 100 filles", range=[y_min, y_max], gridcolor="#333"),
-        xaxis=dict(gridcolor="#333"),
-    )
-    st.plotly_chart(fig1, use_container_width=True)
-
-with col_verdict:
-    st.subheader("Verdict")
-    if abs(delta) < 0.5:
-        st.success(
-            f"**Différence : {delta:+.4f} garçons / 100 filles**\n\n"
-            "IC 95% se chevauchent. Même avec une distribution de gestation réaliste, "
-            "la différence reste du **bruit statistique pur**.\n\n"
-            "✅ **La lune montante/descendante n'influence pas le sexe du bébé.**"
-        )
-    else:
-        st.warning(f"Différence ({delta:+.4f}) — inattendu avec ce volume de données.")
-    st.markdown("---")
-    st.markdown(f"""
-**IC 95% montante :** ±{ci_wax:.4f}
-**IC 95% descendante :** ±{ci_wan:.4f}
-
-**Méthode :** chaque naissance distribuée sur 101 jours de conception pondérés (Jukic 2013 / CDC).
-""")
-
-st.divider()
-
-# ── Les 8 phases ──────────────────────────────────────────────────────────────
-
-st.subheader("Ratio garçons/filles par phase lunaire")
-st.caption("Si la lune avait un effet, on verrait une tendance progressive montante → descendante. Les barres restent plates.")
-
-phase_data = []
-for phase in PHASE_ORDER:
-    d = phase_births.get(phase, {"M": 0.0, "F": 0.0})
-    r, ci = ratio_ci(d)
-    phase_data.append({"phase": phase, "ratio": r, "ci": ci,
-                        "births_M": d.get("M", 0.0), "births_F": d.get("F", 0.0)})
-
-global_ratio = sex_ratio({"M": sum(d["births_M"] for d in phase_data),
-                           "F": sum(d["births_F"] for d in phase_data)})
-
-fig2 = go.Figure()
-fig2.add_trace(go.Bar(
-    x=[d["phase"] for d in phase_data],
-    y=[d["ratio"] for d in phase_data],
-    error_y=dict(
-        type="data", array=[d["ci"] for d in phase_data],
-        visible=True, color="white", thickness=1.5,
-    ),
-    marker_color=PHASE_COLORS,
-    text=[f"{d['ratio']:.4f}" for d in phase_data],
-    textposition="outside", textfont=dict(color="white", size=9),
-    hovertemplate="<b>%{x}</b><br>Ratio: %{y:.4f}<br>±IC 95%: %{error_y.array:.4f}<extra></extra>",
-))
-fig2.add_hline(
-    y=global_ratio, line_color="#ff4b4b", line_dash="dash", line_width=1.5,
-    annotation_text=f"Moyenne : {global_ratio:.4f}",
-    annotation_font_color="#ff4b4b",
-)
-vals2 = [d["ratio"] for d in phase_data]
-cis2  = [d["ci"]    for d in phase_data]
-fig2.update_layout(
-    **dark_layout(height=380, showlegend=False),
-    yaxis=dict(
-        title="Garçons pour 100 filles", gridcolor="#333",
-        range=[min(vals2) - max(cis2) - 0.5, max(vals2) + max(cis2) + 0.5],
-    ),
-    xaxis=dict(gridcolor="#333"),
-)
-st.plotly_chart(fig2, use_container_width=True)
-
-# Table
-table = pd.DataFrame(phase_data)[["phase", "ratio", "ci", "births_M", "births_F"]]
-table["total_weighted"] = table["births_M"] + table["births_F"]
-table = table.rename(columns={
-    "phase": "Phase", "ratio": "Ratio (G/100F)", "ci": "±IC 95%",
-    "births_M": "Garçons (pondéré)", "births_F": "Filles (pondéré)", "total_weighted": "Total pondéré"
-})
-for col in ["Ratio (G/100F)", "±IC 95%"]:
-    table[col] = table[col].map("{:.4f}".format)
-for col in ["Garçons (pondéré)", "Filles (pondéré)", "Total pondéré"]:
-    table[col] = table[col].map("{:,.0f}".format)
-st.dataframe(table.set_index("Phase"), use_container_width=True)
 
 st.divider()
 
