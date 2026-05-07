@@ -392,19 +392,14 @@ fig3.update_layout(
         bgcolor="#0d1020", bordercolor="#444", borderwidth=1,
         font=dict(size=11), orientation="h", yanchor="bottom", y=-0.30, x=0,
     ),
-    annotations=[dict(
-        x=0.01, y=0.04, xref="paper", yref="paper",
-        text=(
-            "Si la croyance était vraie : courbes théoriques (tirets) devraient<br>"
-            "diverger fortement entre lune montante et descendante.<br>"
-            "La fenêtre de gestation (200–300 j ≈ 3.4 cycles) brouille tout → courbes superposées."
-        ),
-        showarrow=False, align="left",
-        bgcolor="#0d1020", bordercolor="#555", borderwidth=1,
-        font=dict(size=10, color="white"),
-    )],
 )
 st.plotly_chart(fig3, use_container_width=True)
+st.caption(
+    "Si la croyance était vraie, les courbes théoriques (tirets) devraient diverger clairement "
+    "des courbes observées entre lune montante et descendante. "
+    "La fenêtre de gestation (200–300 j ≈ 3.4 cycles lunaires) brouille quasi-totalement le signal : "
+    "les courbes théoriques et observées sont indiscernables."
+)
 
 st.divider()
 
