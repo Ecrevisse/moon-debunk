@@ -91,12 +91,12 @@ def load_birth_lunar_ages(birth_dates_tuple):
 def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
     """
     x-axis: birth lunar day.
-
-    Returns observed ratio per bin, plus two theoretical curves:
-    - naive: step function applied to birth lunar day (no gestation)
-    - correct: convolution of theory with gestation distribution
-      P_waxing(birth_date) = gestation-weighted fraction of conception window that is waxing
-      → nearly flat because the window spans ~3.4 lunar cycles
+    Observed: actual sex ratio per bin.
+    Theoretical: propagates the waxing/waning effect at conception through the
+    gestation distribution. P_waxing(birth_date) = gestation-weighted fraction
+    of the conception window (200-300 days) that falls on a waxing moon.
+    Because the window spans ~3.4 lunar cycles, P_waxing ≈ 0.5 for all birth
+    dates — the signal is almost entirely destroyed.
     """
     df = _load_births()
     gest = pd.read_csv("daily_gestation_probabilities.csv")
@@ -109,47 +109,31 @@ def compute_birth_lunar_cycle(birth_dates_tuple, n_bins=30, effect_delta=0.05):
 
     total_M = df.loc[df["gender"] == "M", "births"].sum()
     total_F = df.loc[df["gender"] == "F", "births"].sum()
-    global_p = total_M / (total_M + total_F)  # ≈ 0.512
+    global_p = total_M / (total_M + total_F)
 
-    obs_M    = np.zeros(n_bins)
-    obs_F    = np.zeros(n_bins)
-    theo_M   = np.zeros(n_bins)  # correct: with gestation distribution
-    theo_F   = np.zeros(n_bins)
-    naive_M  = np.zeros(n_bins)  # naive: step at birth lunar day
-    naive_F  = np.zeros(n_bins)
+    obs_M  = np.zeros(n_bins)
+    obs_F  = np.zeros(n_bins)
+    theo_M = np.zeros(n_bins)
+    theo_F = np.zeros(n_bins)
 
     for _, row in df.iterrows():
         bd, gender, births = row["date"], row["gender"], row["births"]
 
-        b_age = birth_ages[bd]
-        b_bin = min(int(b_age / LUNAR_CYCLE * n_bins), n_bins - 1)
+        b_bin = min(int(birth_ages[bd] / LUNAR_CYCLE * n_bins), n_bins - 1)
 
-        # ── Observed ─────────────────────────────────────────────────────────
         if gender == "M":
             obs_M[b_bin] += births
         else:
             obs_F[b_bin] += births
 
-        # ── Correct theoretical ───────────────────────────────────────────────
-        # P_waxing: fraction of conception window (j=200..300) that is waxing,
-        # weighted by gestation probability. gest weights sum to 1.
-        P_waxing = sum(
-            gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1]
-        )
-        # Under theory: P(boy) = global_p + delta*(2*P_waxing - 1)
-        # P_waxing ≈ 0.5 for all birth dates → effect nearly vanishes
+        # Gestation-weighted fraction of waxing conception days for this birth date
+        P_waxing = sum(gest_w[o] for o in offsets if moon_cache[bd - timedelta(days=o)][1])
+
         p_boy_theo = float(np.clip(global_p + effect_delta * (2 * P_waxing - 1), 0, 1))
         theo_M[b_bin] += births * p_boy_theo
         theo_F[b_bin] += births * (1 - p_boy_theo)
 
-        # ── Naive theoretical ─────────────────────────────────────────────────
-        # Applies the theory to the BIRTH lunar day (ignores gestation entirely)
-        birth_is_waxing = b_age <= LUNAR_CYCLE / 2
-        p_boy_naive = float(np.clip(global_p + effect_delta * (1 if birth_is_waxing else -1), 0, 1))
-        naive_M[b_bin] += births * p_boy_naive
-        naive_F[b_bin] += births * (1 - p_boy_naive)
-
-    return obs_M, obs_F, theo_M, theo_F, naive_M, naive_F
+    return obs_M, obs_F, theo_M, theo_F
 
 
 @st.cache_data
@@ -355,7 +339,7 @@ effect_delta = st.sidebar.slider(
     help="Δ = shift absolu de P(garçon). Ex: Δ=0.05 → P(garçon|lune montante)=56%, P(garçon|lune descendante)=46%"
 )
 
-obs_M, obs_F, theo_M, theo_F, naive_M, naive_F = compute_birth_lunar_cycle(
+obs_M, obs_F, theo_M, theo_F = compute_birth_lunar_cycle(
     birth_dates_tuple, N_BINS, effect_delta
 )
 
@@ -370,10 +354,9 @@ def to_ci(M, F):
     p = np.where(n > 0, M / n, 0.512)
     return np.where(n > 0, 1.96 * np.sqrt(p * (1 - p) / n) * 100 / np.where(F > 0, F / n, 1), np.nan)
 
-obs_ratio   = to_ratio(obs_M, obs_F)
-theo_ratio  = to_ratio(theo_M, theo_F)
-naive_ratio = to_ratio(naive_M, naive_F)
-obs_ci      = to_ci(obs_M, obs_F)
+obs_ratio  = to_ratio(obs_M, obs_F)
+theo_ratio = to_ratio(theo_M, theo_F)
+obs_ci     = to_ci(obs_M, obs_F)
 
 # Smoothed observed (3-bin circular rolling average)
 obs_smooth = np.array([
@@ -381,11 +364,10 @@ obs_smooth = np.array([
 ])
 
 global_avg = float(np.nansum(obs_M) / np.nansum(obs_F) * 100)
-obs_std    = float(np.nanstd(obs_ratio))
-
-# Naive amplitude (ratio shift) for annotation
-naive_amp = float(np.nanmax(naive_ratio) - np.nanmin(naive_ratio))
-theo_amp  = float(np.nanmax(theo_ratio)  - np.nanmin(theo_ratio))
+obs_std   = float(np.nanstd(obs_ratio))
+theo_amp  = float(np.nanmax(theo_ratio) - np.nanmin(theo_ratio))
+# Amplitude the theory would produce WITHOUT gestation blurring (pure step in conception space)
+naive_amp = effect_delta * 2 / 0.488 * 100  # approx: Δ applied to waxing vs waning halves
 
 fig_cycle, ax_c = plt.subplots(figsize=(12, 5.5))
 fig_cycle.patch.set_facecolor("#0f1117")
@@ -407,13 +389,11 @@ ax2_c.set_ylim(0, bin_total_obs.max() / 1e6 * 8)
 ax_c.axhline(global_avg, color="#ff4b4b", linewidth=1.1, linestyle=":",
              label=f"Moyenne globale : {global_avg:.3f}", zorder=3)
 
-# Naive theoretical (step function — ignores gestation)
-ax_c.plot(bin_centers, naive_ratio, color="#ff9500", linewidth=2.0,
-          linestyle="--", label=f"Théorique naïf (Δ={effect_delta}, sans distribution gestation) — amplitude {naive_amp:.2f}", zorder=4)
-
-# Correct theoretical (with gestation — nearly flat)
+# Theoretical with gestation (nearly flat)
 ax_c.plot(bin_centers, theo_ratio, color="#e040fb", linewidth=2.2,
-          linestyle="-", label=f"Théorique correct (avec distribution gestation) — amplitude {theo_amp:.4f}", zorder=5)
+          linestyle="-",
+          label=f"Théorique (Δ={effect_delta}, convolution gestation) — amplitude {theo_amp:.4f} g/100f",
+          zorder=5)
 
 # CI band observed
 ax_c.fill_between(bin_centers, obs_ratio - obs_ci, obs_ratio + obs_ci,
@@ -434,10 +414,9 @@ for x, sym in [(0, "🌑"), (LUNAR_CYCLE / 4, "🌓"), (LUNAR_CYCLE / 2, "🌕")
 # Annotation
 ratio_reduction = (1 - theo_amp / naive_amp) * 100 if naive_amp > 0 else 0
 ax_c.annotate(
-    f"Amplitude naïve (sans gestation) : {naive_amp:.2f} g/100f\n"
-    f"Amplitude correcte (avec gestation) : {theo_amp:.4f} g/100f\n"
-    f"→ La distribution de gestation réduit le signal de {ratio_reduction:.0f}%\n"
-    f"   Même si la théorie est vraie, le signal est indétectable.",
+    f"Effet théorique à la conception (Δ={effect_delta}) : ±{naive_amp/2:.2f} g/100f\n"
+    f"Signal résiduel à la naissance (après convolution gestation) : {theo_amp:.4f} g/100f\n"
+    f"→ Réduction : {ratio_reduction:.0f}% — signal indétectable même si la théorie est vraie.",
     xy=(LUNAR_CYCLE * 0.01, global_avg - naive_amp / 2 - 0.3),
     fontsize=8.5, color="white", va="top",
     bbox=dict(boxstyle="round,pad=0.5", facecolor="#0d1020", edgecolor="#555"),
