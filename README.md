@@ -2,7 +2,7 @@
 
 Analyse statistique pour démystifier la croyance populaire selon laquelle la phase lunaire (montante ou descendante) influencerait le sexe du bébé à la conception.
 
-**Résultat :** sur 39 ans de naissances américaines (CDC, 1969–2008), la différence de ratio garçons/filles entre lune montante et descendante est de **−0.04 pour 100**, soit du bruit statistique pur.
+**Résultat :** sur 39 ans de naissances américaines (CDC, 1969–2008), l'écart de ratio garçons/filles entre toutes les phases lunaires est de **0.054 pour 100**, soit du bruit statistique pur.
 
 ---
 
@@ -60,15 +60,27 @@ Note : les lignes avec `day = 99` sont des agrégats mensuels (sexe non ventilé
 
 ## Méthodologie
 
-1. **Date de conception** = date de naissance − 38 semaines (durée moyenne de grossesse)
-2. **Phase lunaire** calculée avec la bibliothèque [`ephem`](https://rhodesmill.org/pyephem/) à la date de conception
-3. **Lune montante** = illumination croissante jour J → jour J+1
-4. **Ratio** = (naissances garçons / naissances filles) × 100
-5. **Intervalle de confiance** à 95% via approximation de Wilson
+1. **Distribution de gestation** générée via `generate_gestation_distribution.py` (skew-normal calée sur Jukic et al. 2013 + CDC) → `daily_gestation_probabilities.csv` (jours 200–300 depuis la conception)
+2. **Phase lunaire** pré-calculée avec [`ephem`](https://rhodesmill.org/pyephem/) pour toutes les dates de conception possibles (7 400+ dates uniques)
+3. **Pondération** : chaque naissance est distribuée sur les 101 jours de conception possibles, chaque fraction pondérée par la probabilité de gestation du jour correspondant
+4. **Lune montante** = illumination croissante jour J → jour J+1
+5. **Ratio** = (naissances pondérées garçons / naissances pondérées filles) × 100
+6. **Intervalle de confiance** à 95% via approximation de Wilson
+
+## Fichiers
+
+| Fichier | Rôle |
+|---|---|
+| `births.csv` | Données CDC brutes |
+| `generate_gestation_distribution.py` | Génère `daily_gestation_probabilities.csv` |
+| `daily_gestation_probabilities.csv` | Distribution de gestation (j200–j300) |
+| `moon_sex_ratio.py` | Script console complet |
+| `app.py` | Interface Streamlit |
 
 ## Stack
 
 - `pandas` — manipulation des données
 - `ephem` — calculs astronomiques
+- `scipy` — distribution skew-normal pour la gestation
 - `matplotlib` — graphiques
 - `streamlit` — interface web
