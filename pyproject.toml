@@ -1,0 +1,12 @@
+[project]
+name = "moon-debunk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ephem>=4.2.1",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.2",
+    "streamlit>=1.57.0",
+]
